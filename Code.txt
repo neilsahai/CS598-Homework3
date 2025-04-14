@@ -1,0 +1,157 @@
+------Script for loading data---------
+
+import pandas as pd
+from google.cloud import bigtable
+from google.cloud.bigtable import row
+
+# Load the CSV file
+df = pd.read_csv("Electric_Vehicle_Population_Data.csv")
+
+# Select necessary columns and drop rows with missing data
+df = df[['DOL Vehicle ID', 'Make', 'Model Year', 'Electric Range', 'City', 'County']].dropna()
+
+# Standardize column names (lowercase and replace spaces with underscores)
+df.columns = [col.lower().replace(" ", "_") for col in df.columns]
+
+# Connect to Bigtable with your Project ID and enable admin mode
+client = bigtable.Client(project='cs598-dmc-451320', admin=True)
+instance = client.instance('ev-bigtable')
+table = instance.table('ev-population')
+
+# Define the column family used in Bigtable
+COLUMN_FAMILY_ID = 'ev_info'
+
+# Prepare a batch list for rows and set the batch size
+batch = []
+batch_size = 100
+
+# Loop over each record and add cells
+for index, row_data in df.iterrows():
+    # Convert the DOL Vehicle ID to a string for the row key
+    row_key = str(int(row_data['dol_vehicle_id']))
+    bt_row = table.direct_row(row_key)
+    
+    # Set cell values; explicitly encode strings as UTF-8 bytes
+    bt_row.set_cell(COLUMN_FAMILY_ID, 'make', str(row_data['make']).encode('utf-8'))
+    bt_row.set_cell(COLUMN_FAMILY_ID, 'model', b'')  
+    bt_row.set_cell(COLUMN_FAMILY_ID, 'model_year', str(int(row_data['model_year'])).encode('utf-8'))
+    bt_row.set_cell(COLUMN_FAMILY_ID, 'electric_range', str(int(row_data['electric_range'])).encode('utf-8'))
+    bt_row.set_cell(COLUMN_FAMILY_ID, 'city', str(row_data['city']).encode('utf-8'))
+    bt_row.set_cell(COLUMN_FAMILY_ID, 'county', str(row_data['county']).encode('utf-8'))
+
+    # Append the row to the batch
+    batch.append(bt_row)
+
+    # If we've reached the batch size, write the batch to Bigtable
+    if len(batch) >= batch_size:
+        table.mutate_rows(batch)
+        batch.clear()
+
+# Write any remaining rows not reaching a full batch
+if batch:
+    table.mutate_rows(batch)
+
+print("Data loaded successfully.")
+
+
+----Script for querying data------
+from flask import Flask
+from google.cloud import bigtable
+from google.cloud.bigtable import row
+
+app = Flask(__name__)
+
+# Connect to Bigtable and reference the table
+client = bigtable.Client(project='cs598-dmc-451320', admin=True)
+instance = client.instance('ev-bigtable')
+table = instance.table('ev-population')
+COLUMN_FAMILY_ID = 'ev_info'
+
+# Endpoint: /rows - returns the total number of rows in Bigtable
+@app.route('/rows', methods=['GET'])
+def get_rows():
+    total = 0
+    rows_iterator = table.read_rows()
+    for _ in rows_iterator:
+        total += 1
+    return str(total)
+
+# Endpoint: /Best-BMW - count BMW EVs with electric range > 100 miles
+@app.route('/Best-BMW', methods=['GET'])
+def best_bmw():
+    count = 0
+    rows_iterator = table.read_rows()
+    for bt_row in rows_iterator:
+        try:
+            # Retrieve cell values and decode from bytes to UTF-8 strings
+            make = bt_row.cells[COLUMN_FAMILY_ID]['make'][0].value.decode('utf-8')
+            er = bt_row.cells[COLUMN_FAMILY_ID]['electric_range'][0].value.decode('utf-8')
+        except KeyError:
+            continue
+        if make.lower() == "bmw":
+            try:
+                if int(er) > 100:
+                    count += 1
+            except ValueError:
+                continue
+    return str(count)
+
+# Endpoint: /tesla-owners - count Tesla vehicles registered in Seattle
+@app.route('/tesla-owners', methods=['GET'])
+def tesla_owners():
+    count = 0
+    rows_iterator = table.read_rows()
+    for bt_row in rows_iterator:
+        try:
+            make = bt_row.cells[COLUMN_FAMILY_ID]['make'][0].value.decode('utf-8')
+            city = bt_row.cells[COLUMN_FAMILY_ID]['city'][0].value.decode('utf-8')
+        except KeyError:
+            continue
+        if make.lower() == "tesla" and city.lower() == "seattle":
+            count += 1
+    return str(count)
+
+# Endpoint: /update - update the electric range of vehicle 257246118 to 200 miles
+@app.route('/update', methods=['GET', 'POST'])
+def update_vehicle():
+    vehicle_id = "257246118"
+    bt_row = table.direct_row(vehicle_id)
+    # Update the electric_range cell to '200'. Note: use bytes for the new value.
+    bt_row.set_cell(COLUMN_FAMILY_ID, 'electric_range', b"200")
+    bt_row.commit()
+    return '"Success"'
+
+# Endpoint: /delete - delete rows with model_year < 2014 and return count of remaining rows
+@app.route('/delete', methods=['GET', 'POST'])
+def delete_old_records():
+    deletion_batch = []
+    rows_iterator = table.read_rows()
+    for bt_row in rows_iterator:
+        try:
+            model_year = bt_row.cells[COLUMN_FAMILY_ID]['model_year'][0].value.decode('utf-8')
+        except KeyError:
+            continue
+        try:
+            if int(model_year) < 2014:
+                # Reconstruct the row key as a string; bt_row.row_key is in bytes.
+                row_key_str = bt_row.row_key.decode('utf-8')
+                delete_row = table.direct_row(row_key_str)
+                delete_row.delete()
+                deletion_batch.append(delete_row)
+        except ValueError:
+            continue
+
+    # Execute deletion in batch if there are rows to delete
+    if deletion_batch:
+        table.mutate_rows(deletion_batch)
+
+    # Count remaining rows
+    remaining = 0
+    for _ in table.read_rows():
+        remaining += 1
+    return str(remaining)
+
+if __name__ == '__main__':
+    # Start the Flask app on port 8080 and bind to all interfaces.
+    app.run(host='0.0.0.0', port=8080, debug=True)
+
